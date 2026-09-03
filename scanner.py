@@ -37,15 +37,13 @@ WAT = timezone(timedelta(hours=1))  # West Africa Time, fixed UTC+1, no DST
 # The index rows are placeholders — confirm before relying on them.
 # ============================================================
 WATCHLIST = [
-    {"display": "EURCAD", "twelvedata_symbol": "EUR/CAD"},
-    {"display": "CADCHF", "twelvedata_symbol": "CAD/CHF"},
     {"display": "GBPUSD", "twelvedata_symbol": "GBP/USD"},
     {"display": "USDJPY", "twelvedata_symbol": "USD/JPY"},
-    # --- verify these two before trusting alerts on them ---
-    {"display": "UK100", "twelvedata_symbol": "UK100"},
-    {"display": "JPN225", "twelvedata_symbol": "JPN225"},
+    {"display": "EURUSD", "twelvedata_symbol": "EUR/USD"},
+    {"display": "AUDUSD", "twelvedata_symbol": "AUD/USD"},
+    {"display": "XAUUSD", "twelvedata_symbol": "XAU/USD"},
+    {"display": "BTCUSD", "twelvedata_symbol": "BTC/USD"},
 ]
-
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
