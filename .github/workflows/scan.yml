@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+  concurrency:
+  group: apex-scanner
+  cancel-in-progress: false
 
 jobs:
   scan:
