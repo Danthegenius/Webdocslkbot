@@ -146,6 +146,9 @@ def process_symbol(entry, state, run_time_str, now):
         return state
 
     sym_state = state.get(display, {})
+    if not isinstance(sym_state, dict):
+        # leftover from an older state format - discard rather than crash
+        sym_state = {}
     pending = sym_state.get("pending")
 
     if pending and is_expired(pending, now):
