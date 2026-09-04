@@ -1,20 +1,27 @@
 """
-APEX Sweep Scanner
--------------------
-Detects the "previous candle sweep" pattern (D1 -> H4) across a watchlist
-and sends a formatted Telegram alert, styled after the slkradar-bot format.
+APEX Structure Scanner (v2)
+----------------------------
+Implements: Daily storyline (rejection from a daily keylevel) confirmed by
+a 4H BOS (body close beyond the swing that started the reactive leg).
 
-Rule:
-  - Take the last CLOSED daily (D1) candle's high/low.
-  - Watch the most recently CLOSED 4-hour (H4) candle.
-  - SELL bias  : H4 wicks above the D1 high, then H4 CLOSES back below it.
-  - BUY bias   : H4 wicks below the D1 low,  then H4 CLOSES back above it.
-  - This is a bias/context flag only — NOT an entry signal.
+This is the "mid-week" pipeline per your own rule: start from the daily
+storyline, confirm on 4H. The Weekly -> Daily confirmation layer (used at
+the start of a new week) is NOT included yet — flagged as a deliberate
+first-pass scope cut, not an oversight.
 
-Data source: Twelve Data (free tier: 800 calls/day, 8 calls/min).
-Delivery: Telegram Bot API (sendMessage).
-State: data/state.json — prevents re-alerting the same D1/H4 combo on every run.
-        Must be committed back to the repo by the GitHub Actions workflow.
+Pipeline per symbol, per run:
+  - No pending setup?  -> scan for a fresh daily rejection off the current
+    daily keylevel. If found, compute the origin swing (where the leg into
+    the keylevel started) and store it as "pending", waiting on a 4H BOS.
+  - Pending setup exists? -> look at 4H bars since the rejection:
+      1. First confirm the 4H origin swing (the small pullback high/low
+         that forms shortly after the daily rejection).
+      2. Once that exists, watch for a 4H candle body-closing beyond it —
+         that's the BOS. Fire the alert, clear the pending setup.
+  - A pending setup with no BOS after EXPIRY_DAYS is dropped (stale).
+
+State persisted in data/state.json so pending setups survive across the
+30-min scheduled runs.
 """
 
 import os
@@ -22,19 +29,15 @@ import json
 import time
 import sys
 from datetime import datetime, timezone, timedelta
+
 import requests
 
-WAT = timezone(timedelta(hours=1))  # West Africa Time, fixed UTC+1, no DST
+from structure import find_swings, active_keylevels, origin_swing, check_rejection, check_bos
+
+WAT = timezone(timedelta(hours=1))
 
 # ============================================================
-# WATCHLIST — edit this to match what you actually want scanned.
-#
-# "twelvedata_symbol" MUST be verified against Twelve Data's own
-# symbol search before you trust it — especially for indices, where
-# naming varies a lot by provider (e.g. "UK100" vs "FTSE" vs "GB100").
-# Check: https://api.twelvedata.com/symbol_search?symbol=FTSE
-# Forex pairs are reliable as "EUR/CAD" style, so those below are safe.
-# The index rows are placeholders — confirm before relying on them.
+# WATCHLIST - same symbols as before. Edit freely.
 # ============================================================
 WATCHLIST = [
     {"display": "GBPUSD", "twelvedata_symbol": "GBP/USD"},
@@ -44,13 +47,17 @@ WATCHLIST = [
     {"display": "XAUUSD", "twelvedata_symbol": "XAU/USD"},
     {"display": "BTCUSD", "twelvedata_symbol": "BTC/USD"},
 ]
+
+DAILY_LOOKBACK = 3     # candles each side to confirm a daily swing
+EXPIRY_DAYS = 5         # drop a pending setup if no BOS within this many calendar days
+
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 STATE_PATH = os.path.join(os.path.dirname(__file__), "data", "state.json")
 BASE_URL = "https://api.twelvedata.com/time_series"
-TZ_NAME = "Africa/Lagos"  # WAT, UTC+1, no DST — Twelve Data returns datetimes already in this tz
+TZ_NAME = "Africa/Lagos"
 
 
 def load_state():
@@ -66,14 +73,15 @@ def save_state(state):
         json.dump(state, f, indent=2, sort_keys=True)
 
 
-def fetch_series(symbol, interval, outputsize=3):
+def fetch_series_asc(symbol, interval, outputsize):
+    """Returns bars OLDEST -> NEWEST, the order structure.py expects."""
     params = {
         "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
         "timezone": TZ_NAME,
         "apikey": TWELVEDATA_API_KEY,
-        "order": "desc",  # most recent first
+        "order": "asc",
     }
     resp = requests.get(BASE_URL, params=params, timeout=20)
     resp.raise_for_status()
@@ -81,29 +89,17 @@ def fetch_series(symbol, interval, outputsize=3):
     if data.get("status") == "error":
         raise RuntimeError(f"Twelve Data error for {symbol} ({interval}): {data.get('message')}")
     values = data.get("values")
-    if not values or len(values) < 2:
+    if not values or len(values) < (2 * DAILY_LOOKBACK + 5):
         raise RuntimeError(f"Not enough {interval} data returned for {symbol}")
-    return values  # values[0] = most recent (may still be forming), values[1] = last closed
+    bars = [
+        {"datetime": v["datetime"], "high": float(v["high"]), "low": float(v["low"]), "close": float(v["close"])}
+        for v in values
+    ]
+    return bars
 
 
 def fmt_price(x):
-    return f"{float(x):.5f}" if abs(float(x)) < 100 else f"{float(x):.2f}"
-
-
-def build_message(display, direction, rejection_dt, external_bo_dt, level, swept_price, run_time_str):
-    arrow = "🔻" if direction == "SELL" else "🔺"
-    swept_label = "high" if direction == "SELL" else "low"
-    close_action = "closed back below" if direction == "SELL" else "closed back above"
-    return (
-        f"BIAS CONFIRMED - EXTERNAL BO {arrow} {direction} {display} (D1->H4)\n\n"
-        f"Rule       : Previous candle sweep\n"
-        f"Rejection  : {rejection_dt} WAT\n"
-        f"External BO: {external_bo_dt} WAT\n"
-        f"Level      : {fmt_price(level)}\n\n"
-        f"swept previous candle {swept_label} {fmt_price(swept_price)}, {close_action}\n\n"
-        f"Not an entry signal, look for your entry model.\n"
-        f"\u23f0 Alert generated: {run_time_str} WAT"
-    )
+    return f"{x:.5f}" if abs(x) < 100 else f"{x:.2f}"
 
 
 def send_telegram(text):
@@ -112,57 +108,125 @@ def send_telegram(text):
     resp.raise_for_status()
 
 
-def check_symbol(entry, state, run_time_str):
+def build_message(display, direction, keylevel_price, keylevel_time, origin_price, origin_time,
+                   rejection_time, bos_time, run_time_str):
+    arrow = "\U0001F53B" if direction == "SELL" else "\U0001F53A"
+    return (
+        f"BIAS CONFIRMED - 4H BOS {arrow} {direction} {display} (D1->H4)\n\n"
+        f"Rule        : Daily rejection + 4H break of structure\n"
+        f"Daily keylevel : {fmt_price(keylevel_price)} ({keylevel_time} WAT)\n"
+        f"Rejection      : {rejection_time} WAT\n"
+        f"Origin swing   : {fmt_price(origin_price)} ({origin_time} WAT)\n"
+        f"4H BOS         : {bos_time} WAT\n\n"
+        f"Daily rejected off keylevel, 4H closed back through the origin "
+        f"of the move that led into it.\n\n"
+        f"Not an entry signal, look for your entry model.\n"
+        f"\u23f0 Alert generated: {run_time_str} WAT"
+    )
+
+
+def is_expired(pending, now):
+    since = datetime.fromisoformat(pending["rejection_time"].replace(" ", "T"))
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=WAT)
+    return (now - since) > timedelta(days=EXPIRY_DAYS)
+
+
+def process_symbol(entry, state, run_time_str, now):
     display = entry["display"]
     symbol = entry["twelvedata_symbol"]
 
     try:
-        d1 = fetch_series(symbol, "1day", outputsize=3)
-        time.sleep(8)  # stay well under Twelve Data's 8 calls/minute free-tier limit
-        h4 = fetch_series(symbol, "4h", outputsize=3)
+        d1 = fetch_series_asc(symbol, "1day", outputsize=120)
+        time.sleep(8)
+        h4 = fetch_series_asc(symbol, "4h", outputsize=150)
         time.sleep(8)
     except Exception as e:
         print(f"[{display}] skipped: {e}")
         return state
 
-    prev_d1 = d1[1]  # last fully closed daily candle
-    d1_high, d1_low, d1_time = float(prev_d1["high"]), float(prev_d1["low"]), prev_d1["datetime"]
+    sym_state = state.get(display, {})
+    pending = sym_state.get("pending")
 
-    last_h4 = h4[1]  # last fully closed H4 candle (h4[0] may still be forming)
-    h4_high, h4_low, h4_close, h4_time = (
-        float(last_h4["high"]), float(last_h4["low"]), float(last_h4["close"]), last_h4["datetime"]
-    )
+    if pending and is_expired(pending, now):
+        print(f"[{display}] pending {pending['direction']} setup expired (no BOS within {EXPIRY_DAYS}d) - dropping")
+        pending = None
 
-    sell = h4_high > d1_high and h4_close < d1_high
-    buy = h4_low < d1_low and h4_close > d1_low
+    if pending is None:
+        prior_bars = d1[:-1]  # structure as known BEFORE today's (still-forming or just-closed) candle
+        swings = find_swings(prior_bars, lookback=DAILY_LOOKBACK)
+        latest_high, latest_low = active_keylevels(prior_bars, swings)
 
-    if not (sell or buy):
-        return state
+        rejection = None
+        keylevel = None
+        direction = None
 
-    direction = "SELL" if sell else "BUY"
-    signature = f"{d1_time}|{h4_time}|{direction}"
+        if latest_high:
+            r = check_rejection(d1, latest_high)
+            if r:
+                rejection, keylevel, direction = r, latest_high, "SELL"
 
-    if state.get(display) == signature:
-        print(f"[{display}] {direction} bias already alerted for this candle pair — skipping")
-        return state
+        if rejection is None and latest_low:
+            r = check_rejection(d1, latest_low)
+            if r:
+                rejection, keylevel, direction = r, latest_low, "BUY"
 
-    level = h4_close
-    swept_price = d1_high if sell else d1_low
+        if rejection:
+            origin = origin_swing(swings, keylevel)
+            if origin:
+                pending = {
+                    "direction": direction,
+                    "keylevel_price": keylevel["price"],
+                    "keylevel_time": keylevel["datetime"],
+                    "origin_price": origin["price"],
+                    "origin_time": origin["datetime"],
+                    "rejection_time": rejection["datetime"],
+                }
+                sym_state["pending"] = pending
+                print(f"[{display}] NEW {direction} daily rejection at {rejection['datetime']} "
+                      f"(keylevel {fmt_price(keylevel['price'])}, origin {fmt_price(origin['price'])})")
+            else:
+                print(f"[{display}] rejection seen but no origin swing available yet")
+        else:
+            print(f"[{display}] no setup")
 
-    msg = build_message(display, direction, d1_time, h4_time, level, swept_price, run_time_str)
-    send_telegram(msg)
-    print(f"[{display}] sent {direction} alert")
+    else:
+        direction = pending["direction"]
+        rejection_time = pending["rejection_time"]
+        h4_after = [b for b in h4 if b["datetime"] > rejection_time]
 
-    state[display] = signature
+        # Watch 4H candles for the first body close beyond the SAME origin
+        # swing already established from the daily structure - this is
+        # rule 4's "confirm on 4hr", not a separate 4H-scale swing.
+        bos_bar = check_bos(h4_after, {"price": pending["origin_price"]}, direction)
+
+        if bos_bar:
+            msg = build_message(
+                display, direction,
+                pending["keylevel_price"], pending["keylevel_time"],
+                pending["origin_price"], pending["origin_time"],
+                pending["rejection_time"], bos_bar["datetime"],
+                run_time_str,
+            )
+            send_telegram(msg)
+            print(f"[{display}] 4H BOS CONFIRMED at {bos_bar['datetime']} -> alert sent")
+            pending = None
+        else:
+            print(f"[{display}] pending {direction} since {rejection_time} - waiting for 4H BOS through {fmt_price(pending['origin_price'])}")
+
+        sym_state["pending"] = pending
+
+    state[display] = sym_state
     return state
 
 
 def main():
     state = load_state()
-    run_time_str = datetime.now(timezone.utc).astimezone(WAT).strftime("%d %b %Y, %I:%M %p")
+    now = datetime.now(timezone.utc).astimezone(WAT)
+    run_time_str = now.strftime("%d %b %Y, %I:%M %p")
 
     for entry in WATCHLIST:
-        state = check_symbol(entry, state, run_time_str)
+        state = process_symbol(entry, state, run_time_str, now)
 
     save_state(state)
 
