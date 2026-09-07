@@ -1,4 +1,17 @@
 {
+  "AUDCAD": {},
+  "AUDCHF": {},
+  "AUDJPY": {},
+  "AUDNZD": {
+    "pending": {
+      "direction": "SELL",
+      "keylevel_price": 1.2287,
+      "keylevel_time": "2026-09-02",
+      "origin_price": 1.20539,
+      "origin_time": "2026-08-30",
+      "rejection_time": "2026-09-08"
+    }
+  },
   "AUDUSD": {
     "pending": {
       "direction": "SELL",
@@ -10,8 +23,28 @@
     }
   },
   "BTCUSD": {},
+  "CADCHF": {},
+  "CADJPY": {},
+  "CHFJPY": {},
+  "EURAUD": {},
+  "EURCAD": {},
+  "EURCHF": {},
+  "EURGBP": {},
+  "EURJPY": {},
+  "EURNZD": {},
   "EURUSD": {},
+  "GBPAUD": {},
+  "GBPCAD": {},
+  "GBPCHF": {},
+  "GBPJPY": {},
+  "GBPNZD": {},
   "GBPUSD": {},
+  "NZDCAD": {},
+  "NZDCHF": {},
+  "NZDJPY": {},
+  "NZDUSD": {},
+  "USDCAD": {},
+  "USDCHF": {},
   "USDJPY": {},
   "XAUUSD": {}
 }
