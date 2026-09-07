@@ -40,11 +40,41 @@ WAT = timezone(timedelta(hours=1))
 # WATCHLIST - same symbols as before. Edit freely.
 # ============================================================
 WATCHLIST = [
+    # Majors
+    {"display": "EURUSD", "twelvedata_symbol": "EUR/USD"},
     {"display": "GBPUSD", "twelvedata_symbol": "GBP/USD"},
     {"display": "USDJPY", "twelvedata_symbol": "USD/JPY"},
-    {"display": "EURUSD", "twelvedata_symbol": "EUR/USD"},
+    {"display": "USDCHF", "twelvedata_symbol": "USD/CHF"},
+    {"display": "USDCAD", "twelvedata_symbol": "USD/CAD"},
     {"display": "AUDUSD", "twelvedata_symbol": "AUD/USD"},
+    {"display": "NZDUSD", "twelvedata_symbol": "NZD/USD"},
+    # Minors & crosses
+    {"display": "EURGBP", "twelvedata_symbol": "EUR/GBP"},
+    {"display": "EURJPY", "twelvedata_symbol": "EUR/JPY"},
+    {"display": "EURCHF", "twelvedata_symbol": "EUR/CHF"},
+    {"display": "EURCAD", "twelvedata_symbol": "EUR/CAD"},
+    {"display": "EURAUD", "twelvedata_symbol": "EUR/AUD"},
+    {"display": "EURNZD", "twelvedata_symbol": "EUR/NZD"},
+    {"display": "GBPJPY", "twelvedata_symbol": "GBP/JPY"},
+    {"display": "GBPCHF", "twelvedata_symbol": "GBP/CHF"},
+    {"display": "GBPCAD", "twelvedata_symbol": "GBP/CAD"},
+    {"display": "GBPAUD", "twelvedata_symbol": "GBP/AUD"},
+    {"display": "GBPNZD", "twelvedata_symbol": "GBP/NZD"},
+    {"display": "AUDJPY", "twelvedata_symbol": "AUD/JPY"},
+    {"display": "AUDCAD", "twelvedata_symbol": "AUD/CAD"},
+    {"display": "AUDCHF", "twelvedata_symbol": "AUD/CHF"},
+    {"display": "AUDNZD", "twelvedata_symbol": "AUD/NZD"},
+    {"display": "CADJPY", "twelvedata_symbol": "CAD/JPY"},
+    {"display": "CADCHF", "twelvedata_symbol": "CAD/CHF"},
+    {"display": "CHFJPY", "twelvedata_symbol": "CHF/JPY"},
+    {"display": "NZDJPY", "twelvedata_symbol": "NZD/JPY"},
+    {"display": "NZDCAD", "twelvedata_symbol": "NZD/CAD"},
+    {"display": "NZDCHF", "twelvedata_symbol": "NZD/CHF"},
+    # Metals
     {"display": "XAUUSD", "twelvedata_symbol": "XAU/USD"},
+    # Indices
+    {"display": "NAS100", "twelvedata_symbol": "VERIFY_ME"},
+    # Crypto
     {"display": "BTCUSD", "twelvedata_symbol": "BTC/USD"},
 ]
 
