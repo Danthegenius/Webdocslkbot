@@ -39,7 +39,16 @@
   "GBPJPY": {},
   "GBPNZD": {},
   "GBPUSD": {},
-  "NZDCAD": {},
+  "NZDCAD": {
+    "pending": {
+      "direction": "BUY",
+      "keylevel_price": 0.8079,
+      "keylevel_time": "2026-09-03",
+      "origin_price": 0.82791,
+      "origin_time": "2026-08-23",
+      "rejection_time": "2026-09-08"
+    }
+  },
   "NZDCHF": {},
   "NZDJPY": {},
   "NZDUSD": {},
