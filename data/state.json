@@ -35,11 +35,29 @@
   },
   "CADJPY": {},
   "CHFJPY": {},
-  "EURAUD": {},
+  "EURAUD": {
+    "pending": {
+      "direction": "BUY",
+      "keylevel_price": 1.60818,
+      "keylevel_time": "2026-09-04",
+      "origin_price": 1.62518,
+      "origin_time": "2026-09-02",
+      "rejection_time": "2026-09-08"
+    }
+  },
   "EURCAD": {},
   "EURCHF": {},
   "EURGBP": {},
-  "EURJPY": {},
+  "EURJPY": {
+    "pending": {
+      "direction": "BUY",
+      "keylevel_price": 179.14481,
+      "keylevel_time": "2026-08-03",
+      "origin_price": 187.47987,
+      "origin_time": "2026-07-29",
+      "rejection_time": "2026-09-08"
+    }
+  },
   "EURNZD": {},
   "EURUSD": {},
   "GBPAUD": {},
