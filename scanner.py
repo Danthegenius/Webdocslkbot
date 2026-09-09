@@ -1,46 +1,37 @@
 """
-APEX Structure Scanner (v2)
-----------------------------
-Implements: Daily storyline (rejection from a daily keylevel) confirmed by
-a 4H BOS (body close beyond the swing that started the reactive leg).
+APEX Structure Scanner (v3)
+---------------------------
+Weekly -> Daily -> 4H pipeline.
 
-This is the "mid-week" pipeline per your own rule: start from the daily
-storyline, confirm on 4H. The Weekly -> Daily confirmation layer (used at
-the start of a new week) is NOT included yet — flagged as a deliberate
-first-pass scope cut, not an oversight.
+Changes from v2, all deliberate:
 
-Pipeline per symbol, per run:
-  - No pending setup?  -> scan for a fresh daily rejection off the current
-    daily keylevel. If found, compute the origin swing (where the leg into
-    the keylevel started) and store it as "pending", waiting on a 4H BOS.
-  - Pending setup exists? -> look at 4H bars since the rejection:
-      1. First confirm the 4H origin swing (the small pullback high/low
-         that forms shortly after the daily rejection).
-      2. Once that exists, watch for a 4H candle body-closing beyond it —
-         that's the BOS. Fire the alert, clear the pending setup.
-  - A pending setup with no BOS after EXPIRY_DAYS is dropped (stale).
-
-State persisted in data/state.json so pending setups survive across the
-30-min scheduled runs.
+  * 4H BOS is now a 4H-SCALE break (close through the most recent confirmed 4H
+    level), not a close through the DAILY origin swing. v2 required a 4H candle
+    to close 1-5% beyond the rejection, which is why setups expired unfired.
+  * Rejections are evaluated on CLOSED candles. The still-forming daily candle
+    is still allowed (branch 2) but the alert is marked PROVISIONAL.
+  * Cross-timeframe ordering uses parsed datetimes. v2 compared '2026-09-08'
+    against '2026-09-08 12:00:00' as strings, which let 4H bars from inside
+    the rejection day count as confirmation.
+  * A pending setup dies if price closes back through the daily keylevel.
+  * Weekly and daily bars are cached to disk; only 4H is fetched every run.
+  * Alerts are deduped by signature so a setup fires once, not every 30 min.
 """
 
 import os
 import json
-import time
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
 
-from structure import find_swings, active_keylevels, origin_swing, check_rejection, check_bos
+from context import build_context
+from resolver import resolve
 
 WAT = timezone(timedelta(hours=1))
 
-# ============================================================
-# WATCHLIST - same symbols as before. Edit freely.
-# ============================================================
 WATCHLIST = [
-    # Majors
     {"display": "EURUSD", "twelvedata_symbol": "EUR/USD"},
     {"display": "GBPUSD", "twelvedata_symbol": "GBP/USD"},
     {"display": "USDJPY", "twelvedata_symbol": "USD/JPY"},
@@ -48,7 +39,6 @@ WATCHLIST = [
     {"display": "USDCAD", "twelvedata_symbol": "USD/CAD"},
     {"display": "AUDUSD", "twelvedata_symbol": "AUD/USD"},
     {"display": "NZDUSD", "twelvedata_symbol": "NZD/USD"},
-    # Minors & crosses
     {"display": "EURGBP", "twelvedata_symbol": "EUR/GBP"},
     {"display": "EURJPY", "twelvedata_symbol": "EUR/JPY"},
     {"display": "EURCHF", "twelvedata_symbol": "EUR/CHF"},
@@ -70,29 +60,38 @@ WATCHLIST = [
     {"display": "NZDJPY", "twelvedata_symbol": "NZD/JPY"},
     {"display": "NZDCAD", "twelvedata_symbol": "NZD/CAD"},
     {"display": "NZDCHF", "twelvedata_symbol": "NZD/CHF"},
-    # Metals
     {"display": "XAUUSD", "twelvedata_symbol": "XAU/USD"},
-    # Indices
-    {"display": "NAS100", "twelvedata_symbol": "VERIFY_ME"},
-    # Crypto
     {"display": "BTCUSD", "twelvedata_symbol": "BTC/USD"},
+    # NAS100 removed - "VERIFY_ME" threw on every run. Add back once you
+    # confirm the real Twelve Data symbol.
 ]
 
-DAILY_LOOKBACK = 3     # candles each side to confirm a daily swing
-EXPIRY_DAYS = 5         # drop a pending setup if no BOS within this many calendar days
+LOOKBACK = {"1week": 3, "1day": 3, "4h": 3}
+OUTPUTSIZE = {"1week": 200, "1day": 250, "4h": 300}
+
+# how long a cached series stays fresh
+CACHE_TTL = {"1week": timedelta(hours=12), "1day": timedelta(hours=6)}
+
+REQUEST_SPACING = 8  # seconds; free tier is 8 requests/minute
 
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-STATE_PATH = os.path.join(os.path.dirname(__file__), "data", "state.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE_PATH = os.path.join(HERE, "data", "state.json")
+CACHE_DIR = os.path.join(HERE, "data", "cache")
 BASE_URL = "https://api.twelvedata.com/time_series"
 TZ_NAME = "Africa/Lagos"
 
 
+# ---------------------------------------------------------------------------
+# persistence
+# ---------------------------------------------------------------------------
+
 def load_state():
     if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, "r") as f:
+        with open(STATE_PATH) as f:
             return json.load(f)
     return {}
 
@@ -103,12 +102,43 @@ def save_state(state):
         json.dump(state, f, indent=2, sort_keys=True)
 
 
-def fetch_series_asc(symbol, interval, outputsize):
-    """Returns bars OLDEST -> NEWEST, the order structure.py expects."""
+def _cache_path(symbol, interval):
+    safe = symbol.replace("/", "_")
+    return os.path.join(CACHE_DIR, f"{safe}_{interval}.json")
+
+
+def _read_cache(symbol, interval):
+    path = _cache_path(symbol, interval)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            blob = json.load(f)
+        fetched = datetime.fromisoformat(blob["fetched_at"])
+        if datetime.now(timezone.utc) - fetched > CACHE_TTL[interval]:
+            return None
+        return blob["bars"]
+    except Exception:
+        return None
+
+
+def _write_cache(symbol, interval, bars):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(_cache_path(symbol, interval), "w") as f:
+        json.dump({"fetched_at": datetime.now(timezone.utc).isoformat(),
+                   "bars": bars}, f)
+
+
+# ---------------------------------------------------------------------------
+# feed
+# ---------------------------------------------------------------------------
+
+def fetch_series(symbol, interval):
+    """Bars OLDEST -> NEWEST, including the still-forming last bar."""
     params = {
         "symbol": symbol,
         "interval": interval,
-        "outputsize": outputsize,
+        "outputsize": OUTPUTSIZE[interval],
         "timezone": TZ_NAME,
         "apikey": TWELVEDATA_API_KEY,
         "order": "asc",
@@ -117,16 +147,34 @@ def fetch_series_asc(symbol, interval, outputsize):
     resp.raise_for_status()
     data = resp.json()
     if data.get("status") == "error":
-        raise RuntimeError(f"Twelve Data error for {symbol} ({interval}): {data.get('message')}")
+        raise RuntimeError(f"{symbol} {interval}: {data.get('message')}")
     values = data.get("values")
-    if not values or len(values) < (2 * DAILY_LOOKBACK + 5):
-        raise RuntimeError(f"Not enough {interval} data returned for {symbol}")
-    bars = [
-        {"datetime": v["datetime"], "high": float(v["high"]), "low": float(v["low"]), "close": float(v["close"])}
-        for v in values
-    ]
+    minimum = 2 * LOOKBACK[interval] + 10
+    if not values or len(values) < minimum:
+        raise RuntimeError(f"{symbol} {interval}: only {len(values or [])} bars")
+    return [{"datetime": v["datetime"],
+             "high": float(v["high"]),
+             "low": float(v["low"]),
+             "close": float(v["close"])} for v in values]
+
+
+def get_series(symbol, interval, budget):
+    """Cached for weekly/daily, always fresh for 4H. `budget` counts requests."""
+    if interval in CACHE_TTL:
+        cached = _read_cache(symbol, interval)
+        if cached is not None:
+            return cached
+    bars = fetch_series(symbol, interval)
+    budget.append(1)
+    time.sleep(REQUEST_SPACING)
+    if interval in CACHE_TTL:
+        _write_cache(symbol, interval, bars)
     return bars
 
+
+# ---------------------------------------------------------------------------
+# alerting
+# ---------------------------------------------------------------------------
 
 def fmt_price(x):
     return f"{x:.5f}" if abs(x) < 100 else f"{x:.2f}"
@@ -134,134 +182,105 @@ def fmt_price(x):
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
+    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+                         timeout=20)
     resp.raise_for_status()
 
 
-def build_message(display, direction, keylevel_price, keylevel_time, origin_price, origin_time,
-                   rejection_time, bos_time, run_time_str):
-    arrow = "\U0001F53B" if direction == "SELL" else "\U0001F53A"
-    return (
-        f"BIAS CONFIRMED - 4H BOS {arrow} {direction} {display} (D1->H4)\n\n"
-        f"Rule        : Daily rejection + 4H break of structure\n"
-        f"Daily keylevel : {fmt_price(keylevel_price)} ({keylevel_time} WAT)\n"
-        f"Rejection      : {rejection_time} WAT\n"
-        f"Origin swing   : {fmt_price(origin_price)} ({origin_time} WAT)\n"
-        f"4H BOS         : {bos_time} WAT\n\n"
-        f"Daily rejected off keylevel, 4H closed back through the origin "
-        f"of the move that led into it.\n\n"
-        f"Not an entry signal, look for your entry model.\n"
-        f"\u23f0 Alert generated: {run_time_str} WAT"
-    )
+FLAG_TEXT = {
+    "no_weekly_rejection": "No weekly rejection in play",
+    "weekly_daily_divergence": "Weekly and daily bias DISAGREE",
+    "provisional_daily": "Daily candle still forming - rejection may un-print",
+}
 
 
-def is_expired(pending, now):
-    since = datetime.fromisoformat(pending["rejection_time"].replace(" ", "T"))
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=WAT)
-    return (now - since) > timedelta(days=EXPIRY_DAYS)
+def build_message(display, payload, run_time_str):
+    arrow = "\U0001F53B" if payload["action"] == "SELL" else "\U0001F53A"
+    w, d, h = payload["weekly"], payload["daily"], payload["h4"]
+
+    lines = [
+        f"{arrow} {payload['action']} {display}  [{payload['grade']}]",
+        "",
+        f"Weekly bias    : {w['bias'] or 'none'}",
+    ]
+    if w["rejection"]:
+        lines.append(f"Weekly reject  : {w['rejection']['level_kind']}-shaped "
+                     f"{fmt_price(w['rejection']['level_price'])} "
+                     f"({w['rejection']['datetime']})")
+    lines += [
+        f"Daily bias     : {d['bias']} "
+        f"({'aligned' if d['aligned_with_weekly'] else 'NOT aligned'})",
+        f"Daily BOS      : {d['bos_datetime']}",
+        f"Daily reject   : {d['rejection']['level_kind']}-shaped "
+        f"{fmt_price(d['rejection']['level_price'])} ({d['rejection']['datetime']})",
+        f"4H BOS         : {h['bos_datetime']} @ {fmt_price(h['bos_price'])} "
+        f"(through {fmt_price(h['bos_level_price'])})",
+    ]
+    if payload["flags"]:
+        lines += [""] + [f"\u26a0 {FLAG_TEXT.get(f, f)}" for f in payload["flags"]]
+    lines += [
+        "",
+        "Not an entry signal - look for your entry model.",
+        f"\u23f0 {run_time_str} WAT",
+    ]
+    return "\n".join(lines)
 
 
-def process_symbol(entry, state, run_time_str, now):
+# ---------------------------------------------------------------------------
+# per symbol
+# ---------------------------------------------------------------------------
+
+def process_symbol(entry, state, run_time_str, budget):
     display = entry["display"]
     symbol = entry["twelvedata_symbol"]
 
     try:
-        d1 = fetch_series_asc(symbol, "1day", outputsize=120)
-        time.sleep(8)
-        h4 = fetch_series_asc(symbol, "4h", outputsize=150)
-        time.sleep(8)
+        w_bars = get_series(symbol, "1week", budget)
+        d_bars = get_series(symbol, "1day", budget)
+        h_bars = get_series(symbol, "4h", budget)
     except Exception as e:
         print(f"[{display}] skipped: {e}")
-        return state
+        return
 
-    sym_state = state.get(display, {})
+    weekly = build_context(w_bars, "1week", LOOKBACK["1week"])
+    daily = build_context(d_bars, "1day", LOOKBACK["1day"])
+    h4 = build_context(h_bars, "4h", LOOKBACK["4h"])
+
+    payload = resolve(weekly, daily, h4)
+    sym_state = state.get(display) or {}
     if not isinstance(sym_state, dict):
-        # leftover from an older state format - discard rather than crash
         sym_state = {}
-    pending = sym_state.get("pending")
 
-    if pending and is_expired(pending, now):
-        print(f"[{display}] pending {pending['direction']} setup expired (no BOS within {EXPIRY_DAYS}d) - dropping")
-        pending = None
+    if payload is None:
+        print(f"[{display}] no setup "
+              f"(W:{weekly.bias or '-'} D:{daily.bias or '-'})")
+        state[display] = sym_state
+        return
 
-    if pending is None:
-        prior_bars = d1[:-1]  # structure as known BEFORE today's (still-forming or just-closed) candle
-        swings = find_swings(prior_bars, lookback=DAILY_LOOKBACK)
-        latest_high, latest_low = active_keylevels(prior_bars, swings)
+    if sym_state.get("last_signature") == payload["signature"]:
+        print(f"[{display}] {payload['action']} already alerted - skipping")
+        state[display] = sym_state
+        return
 
-        rejection = None
-        keylevel = None
-        direction = None
-
-        if latest_high:
-            r = check_rejection(d1, latest_high)
-            if r:
-                rejection, keylevel, direction = r, latest_high, "SELL"
-
-        if rejection is None and latest_low:
-            r = check_rejection(d1, latest_low)
-            if r:
-                rejection, keylevel, direction = r, latest_low, "BUY"
-
-        if rejection:
-            origin = origin_swing(swings, keylevel)
-            if origin:
-                pending = {
-                    "direction": direction,
-                    "keylevel_price": keylevel["price"],
-                    "keylevel_time": keylevel["datetime"],
-                    "origin_price": origin["price"],
-                    "origin_time": origin["datetime"],
-                    "rejection_time": rejection["datetime"],
-                }
-                sym_state["pending"] = pending
-                print(f"[{display}] NEW {direction} daily rejection at {rejection['datetime']} "
-                      f"(keylevel {fmt_price(keylevel['price'])}, origin {fmt_price(origin['price'])})")
-            else:
-                print(f"[{display}] rejection seen but no origin swing available yet")
-        else:
-            print(f"[{display}] no setup")
-
-    else:
-        direction = pending["direction"]
-        rejection_time = pending["rejection_time"]
-        h4_after = [b for b in h4 if b["datetime"] > rejection_time]
-
-        # Watch 4H candles for the first body close beyond the SAME origin
-        # swing already established from the daily structure - this is
-        # rule 4's "confirm on 4hr", not a separate 4H-scale swing.
-        bos_bar = check_bos(h4_after, {"price": pending["origin_price"]}, direction)
-
-        if bos_bar:
-            msg = build_message(
-                display, direction,
-                pending["keylevel_price"], pending["keylevel_time"],
-                pending["origin_price"], pending["origin_time"],
-                pending["rejection_time"], bos_bar["datetime"],
-                run_time_str,
-            )
-            send_telegram(msg)
-            print(f"[{display}] 4H BOS CONFIRMED at {bos_bar['datetime']} -> alert sent")
-            pending = None
-        else:
-            print(f"[{display}] pending {direction} since {rejection_time} - waiting for 4H BOS through {fmt_price(pending['origin_price'])}")
-
-        sym_state["pending"] = pending
-
+    send_telegram(build_message(display, payload, run_time_str))
+    sym_state["last_signature"] = payload["signature"]
+    sym_state["last_alert_at"] = run_time_str
     state[display] = sym_state
-    return state
+    print(f"[{display}] ALERT {payload['action']} {payload['grade']} "
+          f"flags={payload['flags']}")
 
 
 def main():
     state = load_state()
     now = datetime.now(timezone.utc).astimezone(WAT)
     run_time_str = now.strftime("%d %b %Y, %I:%M %p")
+    budget = []
 
     for entry in WATCHLIST:
-        state = process_symbol(entry, state, run_time_str, now)
+        process_symbol(entry, state, run_time_str, budget)
 
     save_state(state)
+    print(f"\n{len(budget)} API requests this run")
 
 
 if __name__ == "__main__":
